@@ -5,11 +5,16 @@ Option Explicit
 ' 「VBA実行シート」のボタンにこのマクロ（全日の出勤者抽出_）を登録してください
 '
 ' 【事前準備】
-' ・「VBA実行シート」C14セルに、シフト表で「残業」を示す塗りつぶし色を
+' ・「VBA実行シート」C12セルに、シフト表で「残業」を示す塗りつぶし色を
 '   設定してください（シフト表の残業セルと同じ色にしてください）
 '
 ' 【出力順序】
 ' ・日付順 → その日の中ではシフト表に登場する順（上から下）
+'
+' 【年月について】
+' シフト表の日付行には完全な日付（例：2026/6/1）が入力されているため、
+' 年・月を別途指定する必要はありません。1日目の日付から自動的に取得し、
+' 以降の日付がその年月と一致するかどうかの確認にも使用します。
 '==============================================================
 Public Sub 全日の出勤者抽出_()
 
@@ -17,8 +22,6 @@ Public Sub 全日の出勤者抽出_()
     Dim wsShift As Worksheet
     Dim wsStaff As Worksheet
 
-    Dim targetYear As Long
-    Dim targetMonth As Long
     Dim shiftSheetName As String
     Dim dateStartColLetter As String
     Dim staffColLetter As String
@@ -34,7 +37,7 @@ Public Sub 全日の出勤者抽出_()
     Set wsCtrl = ThisWorkbook.Worksheets("VBA実行シート")
 
     '---- 設定値の読み込み＆検証（不備があれば具体的な箇所を案内して終了） ----
-    If Not ValidateAndLoadSettings(wsCtrl, targetYear, targetMonth, shiftSheetName, _
+    If Not ValidateAndLoadSettings(wsCtrl, shiftSheetName, _
             dateStartColLetter, staffColLetter, dateRow, staffStartRow, staffEndRow, _
             otColor, errMsg) Then
         MsgBox "「VBA実行シート」の設定に誤りがあります。" & vbCrLf & vbCrLf & errMsg, vbExclamation
@@ -46,7 +49,7 @@ Public Sub 全日の出勤者抽出_()
     Set wsShift = ThisWorkbook.Worksheets(shiftSheetName)
     On Error GoTo ErrHandler
     If wsShift Is Nothing Then
-        MsgBox "シフト表シート「" & shiftSheetName & "」が見つかりません。C7セルの内容を確認してください。", vbExclamation
+        MsgBox "シフト表シート「" & shiftSheetName & "」が見つかりません。C5セルの内容を確認してください。", vbExclamation
         Exit Sub
     End If
 
@@ -58,19 +61,19 @@ Public Sub 全日の出勤者抽出_()
     Dim staffDict As Object
     Set staffDict = GetStaffDict(wsStaff)
     If staffDict.Count = 0 Then
-        MsgBox "「スタッフ一覧」シートに氏名が見つかりません。B列に「氏名」という見出しがあるか確認してください。", vbExclamation
+        MsgBox "「スタッフ一覧」シートに氏名が見つかりません。A列に「氏名」という見出しがあるか確認してください。", vbExclamation
         Exit Sub
     End If
 
     '---- 日付が入っている列を特定（間に空欄があっても正しく検知する） ----
     Dim dayStartCol As Long
-    dayStartCol = wsShift.Range(dateStartColLetter & "1").Column   ' C9セルで指定された「月初(1日)の列」
+    dayStartCol = wsShift.Range(dateStartColLetter & "1").Column   ' C7セルで指定された「月初(1日)の列」
 
     Dim lastUsedCol As Long
     lastUsedCol = wsShift.Cells(dateRow, wsShift.Columns.Count).End(xlToLeft).Column
 
     If lastUsedCol < dayStartCol Then
-        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C9・C10セルの内容を確認してください。", vbExclamation
+        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C7・C8セルの内容を確認してください。", vbExclamation
         Exit Sub
     End If
 
@@ -92,7 +95,7 @@ Public Sub 全日の出勤者抽出_()
     Next scanCol
 
     If dayColCount = 0 Then
-        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C9・C10セルの内容を確認してください。", vbExclamation
+        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C7・C8セルの内容を確認してください。", vbExclamation
         Exit Sub
     End If
 
@@ -104,13 +107,19 @@ Public Sub 全日の出勤者抽出_()
         Exit Sub
     End If
 
+    '---- 1日目の日付から年月を取得（以降の日付との整合性チェックにも使用） ----
+    Dim targetYear As Long, targetMonth As Long
+    Dim firstDate As Date
+    firstDate = CDate(wsShift.Cells(dateRow, dayCols(1)).Value)
+    targetYear = Year(firstDate)
+    targetMonth = Month(firstDate)
+
     '---- CSV本文を組み立て（① 日付順 → ② シフト表の登場順） ----
     Dim csvText As String
     csvText = "日付,氏名,開始時刻,終了時刻,前残業,後残業,役割" & vbCrLf
 
     Dim staffRow As Long, endRow As Long, c As Long, dIdx As Long
     Dim staffName As String, normName As String, staffRole As String
-    Dim dayNum As Variant
     Dim startCell As Range, endCell As Range
     Dim startVal As String, endVal As String
     Dim dateStr As String
@@ -119,13 +128,12 @@ Public Sub 全日の出勤者抽出_()
 
     For dIdx = 1 To dayColCount
         c = dayCols(dIdx)
-        dayNum = wsShift.Cells(dateRow, c).Value
+        computedDate = CDate(wsShift.Cells(dateRow, c).Value)
 
-        computedDate = DateSerial(targetYear, targetMonth, CLng(dayNum))
-        If Month(computedDate) <> targetMonth Then
-            MsgBox "シフト表の日付（" & dayNum & "日）が、C6セルで指定した月（" & targetMonth & "月）の" & vbCrLf & _
-                "範囲を超えています。前月のシートを流用した際のコピペミスや、" & vbCrLf & _
-                "C6セル・C10セルの設定違いが考えられます。シフト表を確認してください。", vbExclamation
+        If Year(computedDate) <> targetYear Or Month(computedDate) <> targetMonth Then
+            MsgBox "シフト表の日付（" & Format(computedDate, "yyyy-mm-dd") & "）が、" & vbCrLf & _
+                "1日目の日付（" & targetYear & "年" & targetMonth & "月）と異なる年月になっています。" & vbCrLf & _
+                "前月のシートを流用した際のコピペミス等が考えられます。シフト表を確認してください。", vbExclamation
             Exit Sub
         End If
         dateStr = Format(computedDate, "yyyy-mm-dd")
@@ -201,19 +209,19 @@ End Sub
 ' 不備があれば False を返し、errMsg に具体的な原因（どのセルか）を格納する
 '
 ' 【セル配置（B列＝ラベル、C列＝値）】
-'   C5  西暦何年のシフト？
-'   C6  何月のシフト？
-'   C7  シフトが入力されているシートの名前は？
-'   C9  月初の日付（1日）が入力されている列は？
-'   C10 月初の日付（1日）が入力されている行は？
-'   C11 スタッフ名が入力されている列は？
-'   C12 最初のスタッフは何行目？
-'   C13 スタッフ検索は何行目まで行う？
-'   C14 残業セルの色は？（セルの塗りつぶし色そのもの）
+'   C5  シフトが入力されているシートの名前は？
+'   C7  月初の日付（1日）が入力されている列は？
+'   C8  月初の日付（1日）が入力されている行は？
+'   C9  スタッフ名が入力されている列は？
+'   C10 最初のスタッフは何行目？
+'   C11 スタッフ検索は何行目まで行う？
+'   C12 残業セルの色は？（セルの塗りつぶし色そのもの）
+'
+' ※年・月はシフト表の日付セル（完全な日付）から自動取得するため、
+'   このシートでは指定不要。
 '==============================================================
 Private Function ValidateAndLoadSettings( _
         wsCtrl As Worksheet, _
-        ByRef targetYear As Long, ByRef targetMonth As Long, _
         ByRef shiftSheetName As String, _
         ByRef dateStartColLetter As String, ByRef staffColLetter As String, _
         ByRef dateRow As Long, ByRef staffStartRow As Long, ByRef staffEndRow As Long, _
@@ -221,81 +229,61 @@ Private Function ValidateAndLoadSettings( _
 
     ValidateAndLoadSettings = False
 
-    If Not IsNumeric(wsCtrl.Range("C5").Value) Then
-        errMsg = "C5セル（西暦何年のシフト？）に数値を入力してください。"
-        Exit Function
-    End If
-    targetYear = CLng(wsCtrl.Range("C5").Value)
-    If targetYear < 1900 Or targetYear > 2200 Then
-        errMsg = "C5セル（西暦何年のシフト？：" & targetYear & "）が不自然な値です。入力ミスがないか確認してください。"
-        Exit Function
-    End If
-
-    If Not IsNumeric(wsCtrl.Range("C6").Value) Then
-        errMsg = "C6セル（何月のシフト？）に数値（1～12）を入力してください。"
-        Exit Function
-    End If
-    targetMonth = CLng(wsCtrl.Range("C6").Value)
-    If targetMonth < 1 Or targetMonth > 12 Then
-        errMsg = "C6セル（何月のシフト？）は1～12の範囲で入力してください。"
-        Exit Function
-    End If
-
-    shiftSheetName = Trim(wsCtrl.Range("C7").Value)
+    shiftSheetName = Trim(wsCtrl.Range("C5").Value)
     If shiftSheetName = "" Then
-        errMsg = "C7セル（シフトが入力されているシートの名前は？）を入力してください。"
+        errMsg = "C5セル（シフトが入力されているシートの名前は？）を入力してください。"
         Exit Function
     End If
 
-    dateStartColLetter = Trim(wsCtrl.Range("C9").Value)
+    dateStartColLetter = Trim(wsCtrl.Range("C7").Value)
     If Not IsValidColumnLetter(dateStartColLetter) Then
-        errMsg = "C9セル（月初の日付（1日）が入力されている列は？）には「D」のような列のアルファベットを入力してください。"
+        errMsg = "C7セル（月初の日付（1日）が入力されている列は？）には「D」のような列のアルファベットを入力してください。"
+        Exit Function
+    End If
+
+    If Not IsNumeric(wsCtrl.Range("C8").Value) Then
+        errMsg = "C8セル（月初の日付（1日）が入力されている行は？）に数値を入力してください。"
+        Exit Function
+    End If
+    dateRow = CLng(wsCtrl.Range("C8").Value)
+    If dateRow < 1 Then
+        errMsg = "C8セル（月初の日付（1日）が入力されている行は？）は1以上の行番号を入力してください。"
+        Exit Function
+    End If
+
+    staffColLetter = Trim(wsCtrl.Range("C9").Value)
+    If Not IsValidColumnLetter(staffColLetter) Then
+        errMsg = "C9セル（スタッフ名が入力されている列は？）には「B」のような列のアルファベットを入力してください。"
         Exit Function
     End If
 
     If Not IsNumeric(wsCtrl.Range("C10").Value) Then
-        errMsg = "C10セル（月初の日付（1日）が入力されている行は？）に数値を入力してください。"
+        errMsg = "C10セル（最初のスタッフは何行目？）に数値を入力してください。"
         Exit Function
     End If
-    dateRow = CLng(wsCtrl.Range("C10").Value)
-    If dateRow < 1 Then
-        errMsg = "C10セル（月初の日付（1日）が入力されている行は？）は1以上の行番号を入力してください。"
-        Exit Function
-    End If
-
-    staffColLetter = Trim(wsCtrl.Range("C11").Value)
-    If Not IsValidColumnLetter(staffColLetter) Then
-        errMsg = "C11セル（スタッフ名が入力されている列は？）には「B」のような列のアルファベットを入力してください。"
-        Exit Function
-    End If
-
-    If Not IsNumeric(wsCtrl.Range("C12").Value) Then
-        errMsg = "C12セル（最初のスタッフは何行目？）に数値を入力してください。"
-        Exit Function
-    End If
-    staffStartRow = CLng(wsCtrl.Range("C12").Value)
+    staffStartRow = CLng(wsCtrl.Range("C10").Value)
     If staffStartRow < 1 Then
-        errMsg = "C12セル（最初のスタッフは何行目？）は1以上の行番号を入力してください。"
+        errMsg = "C10セル（最初のスタッフは何行目？）は1以上の行番号を入力してください。"
         Exit Function
     End If
 
-    If Not IsNumeric(wsCtrl.Range("C13").Value) Then
-        errMsg = "C13セル（スタッフ検索は何行目まで行う？）に数値を入力してください。"
+    If Not IsNumeric(wsCtrl.Range("C11").Value) Then
+        errMsg = "C11セル（スタッフ検索は何行目まで行う？）に数値を入力してください。"
         Exit Function
     End If
-    staffEndRow = CLng(wsCtrl.Range("C13").Value)
+    staffEndRow = CLng(wsCtrl.Range("C11").Value)
 
     If staffEndRow < staffStartRow Then
-        errMsg = "C13セル（スタッフ検索の最終行：" & staffEndRow & "）が" & vbCrLf & _
-                 "C12セル（最初のスタッフの行：" & staffStartRow & "）より小さくなっています。"
+        errMsg = "C11セル（スタッフ検索の最終行：" & staffEndRow & "）が" & vbCrLf & _
+                 "C10セル（最初のスタッフの行：" & staffStartRow & "）より小さくなっています。"
         Exit Function
     End If
 
-    If wsCtrl.Range("C14").Interior.Pattern = xlNone Then
-        errMsg = "C14セル（残業セルの色は？）に、シフト表の残業セルと同じ塗りつぶし色を設定してください。"
+    If wsCtrl.Range("C12").Interior.Pattern = xlNone Then
+        errMsg = "C12セル（残業セルの色は？）に、シフト表の残業セルと同じ塗りつぶし色を設定してください。"
         Exit Function
     End If
-    otColor = wsCtrl.Range("C14").Interior.Color
+    otColor = wsCtrl.Range("C12").Interior.Color
 
     ValidateAndLoadSettings = True
 End Function
