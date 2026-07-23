@@ -1,0 +1,691 @@
+Option Explicit
+
+'==============================================================
+' シフト表からCSVを出力するメインマクロ
+' 「VBA実行シート」のボタンにこのマクロ（全日の出勤者抽出_）を登録してください
+'
+' 【事前準備】
+' ・「VBA実行シート」C12セルに、シフト表で「残業」を示す塗りつぶし色を
+'   設定してください（シフト表の残業セルと同じ色にしてください）
+'
+' 【出力順序】
+' ・日付順 → その日の中ではシフト表に登場する順（上から下）
+'
+' 【氏名セルの結合について】
+' 氏名セルの結合範囲の高さから、1人あたりのシフト数を自動判定します。
+'   2行結合 → 開始/終了が1組
+'   4行結合 → 開始/終了が2組（午前・午後で分けて着台するスタッフ）
+' 固定行数で送らず結合の高さ分だけ進むため、途中に1行挿入されても
+' 氏名行がズレません。4行結合で午前だけ／午後だけの勤務の場合は、
+' 時刻が入っている組だけを出力します（同じ日に2レコード出ることがあります）。
+'
+' 【年月について】
+' シフト表の日付行には完全な日付（例：2026/6/1）が入力されているため、
+' 年・月を別途指定する必要はありません。1日目の日付から自動的に取得し、
+' 以降の日付がその年月と一致するかどうかの確認にも使用します。
+'==============================================================
+Public Sub 全日の出勤者抽出_()
+
+    Dim wsCtrl As Worksheet
+    Dim wsShift As Worksheet
+    Dim wsStaff As Worksheet
+
+    Dim shiftSheetName As String
+    Dim dateStartColLetter As String
+    Dim staffColLetter As String
+    Dim staffColIdx As Long
+    Dim dateRow As Long
+    Dim staffStartRow As Long
+    Dim staffEndRow As Long
+    Dim otColor As Long
+    Dim errMsg As String
+
+    On Error GoTo ErrHandler
+
+    Set wsCtrl = ThisWorkbook.Worksheets("VBA実行シート")
+
+    '---- 設定値の読み込み＆検証（不備があれば具体的な箇所を案内して終了） ----
+    If Not ValidateAndLoadSettings(wsCtrl, shiftSheetName, _
+            dateStartColLetter, staffColLetter, dateRow, staffStartRow, staffEndRow, _
+            otColor, errMsg) Then
+        MsgBox "「VBA実行シート」の設定に誤りがあります。" & vbCrLf & vbCrLf & errMsg, vbExclamation
+        Exit Sub
+    End If
+
+    '---- シフト表シートの取得 ----
+    On Error Resume Next
+    Set wsShift = ThisWorkbook.Worksheets(shiftSheetName)
+    On Error GoTo ErrHandler
+    If wsShift Is Nothing Then
+        MsgBox "シフト表シート「" & shiftSheetName & "」が見つかりません。C5セルの内容を確認してください。", vbExclamation
+        Exit Sub
+    End If
+
+    Set wsStaff = ThisWorkbook.Worksheets("スタッフ一覧")
+
+    staffColIdx = wsShift.Range(staffColLetter & "1").Column
+
+    '---- 抽出対象スタッフ一覧を取得（氏名→役割 のDictionary。全角/半角スペースを正規化） ----
+    Dim staffDict As Object
+    Set staffDict = GetStaffDict(wsStaff)
+    If staffDict.Count = 0 Then
+        MsgBox "「スタッフ一覧」シートに氏名が見つかりません。A列に「氏名」という見出しがあるか確認してください。", vbExclamation
+        Exit Sub
+    End If
+
+    '---- 日付が入っている列を特定（間に空欄があっても正しく検知する） ----
+    Dim dayStartCol As Long
+    dayStartCol = wsShift.Range(dateStartColLetter & "1").Column   ' C7セルで指定された「月初(1日)の列」
+
+    Dim lastUsedCol As Long
+    lastUsedCol = wsShift.Cells(dateRow, wsShift.Columns.Count).End(xlToLeft).Column
+
+    If lastUsedCol < dayStartCol Then
+        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C7・C8セルの内容を確認してください。", vbExclamation
+        Exit Sub
+    End If
+
+    Dim dayCols() As Long
+    Dim dayColCount As Long, scanCol As Long
+    Dim missingCols As String
+
+    ReDim dayCols(1 To lastUsedCol - dayStartCol + 1)
+    dayColCount = 0
+    missingCols = ""
+
+    For scanCol = dayStartCol To lastUsedCol
+        If IsDateOrNumericValue(wsShift.Cells(dateRow, scanCol).Value) Then
+            dayColCount = dayColCount + 1
+            dayCols(dayColCount) = scanCol
+        Else
+            missingCols = missingCols & ColLetter(wsShift, scanCol) & dateRow & ", "
+        End If
+    Next scanCol
+
+    If dayColCount = 0 Then
+        MsgBox "シフト表の" & dateRow & "行目に日付データが見つかりません。C7・C8セルの内容を確認してください。", vbExclamation
+        Exit Sub
+    End If
+
+    If missingCols <> "" Then
+        missingCols = Left(missingCols, Len(missingCols) - 2)  ' 末尾の ", " を除去
+        MsgBox "シフト表の" & dateRow & "行目に、日付が入っていないセルがあります。" & vbCrLf & _
+            "（" & missingCols & "）" & vbCrLf & vbCrLf & _
+            "日付の抜け漏れがないか確認のうえ、再実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    '---- 1日目の日付から年月を取得（以降の日付との整合性チェックにも使用） ----
+    Dim targetYear As Long, targetMonth As Long
+    Dim firstDate As Date
+    firstDate = CDate(wsShift.Cells(dateRow, dayCols(1)).Value)
+    targetYear = Year(firstDate)
+    targetMonth = Month(firstDate)
+
+    For dIdx = 1 To dayColCount
+        c = dayCols(dIdx)
+        computedDate = CDate(wsShift.Cells(dateRow, c).Value)
+
+        If Year(computedDate) <> targetYear Or Month(computedDate) <> targetMonth Then
+            MsgBox "シフト表の日付（" & Format(computedDate, "yyyy-mm-dd") & "）が、" & vbCrLf & _
+                "1日目の日付（" & targetYear & "年" & targetMonth & "月）と異なる年月になっています。" & vbCrLf & _
+                "前月のシートを流用した際のコピペミス等が考えられます。シフト表を確認してください。", vbExclamation
+            Exit Sub
+        End If
+        dateStr = Format(computedDate, "yyyy-mm-dd")
+
+
+    '---- スタッフのブロック構成を事前に解析する ----
+    ' 氏名セルの結合範囲（MergeArea）の高さから、1人あたり何行使っているかを判定する。
+    '   高さ2 → 開始/終了のペアが1組（通常の勤務）
+    '   高さ4 → 開始/終了のペアが2組（午前・午後で別々に着台するスタッフ）
+    ' 固定のStep 2で送らず、実際の結合の高さ分だけ次の氏名へ進むため、
+    ' 途中で1行だけ挿入された場合でも氏名行がズレずに追従できる。
+    Dim blkRow() As Long        ' 各ブロックの先頭行（氏名セルの行）
+    Dim blkPairs() As Long      ' 各ブロックに含まれる「開始/終了」ペアの数
+    Dim blkCount As Long
+    Dim warnUnmerged As String  ' 結合漏れと判断して処理したブロックの一覧
+    Dim warnOddRows As String   ' 高さが想定外（奇数など）のブロックの一覧
+
+    If Not ScanStaffBlocks(wsShift, staffColIdx, staffStartRow, staffEndRow, _
+            blkRow, blkPairs, blkCount, warnUnmerged, warnOddRows) Then
+        MsgBox "シフト表のスタッフ名の列（" & staffColLetter & "列）に、" & vbCrLf & _
+            "C10～C11で指定した範囲内で氏名が1件も見つかりませんでした。" & vbCrLf & _
+            "C9・C10・C11セルの内容を確認してください。", vbExclamation
+        Exit Sub
+    End If
+
+    '---- CSV本文を組み立て（① 日付順 → ② シフト表の登場順 → ③ ブロック内のペア順） ----
+    Dim csvText As String
+    csvText = "日付,氏名,開始時刻,終了時刻,前残業,後残業,役割" & vbCrLf
+
+    Dim bIdx As Long, pIdx As Long
+    Dim staffRow As Long, sRow As Long, eRow As Long, c As Long, dIdx As Long
+    Dim staffName As String, normName As String, staffRole As String
+    Dim startCell As Range, endCell As Range
+    Dim startVal As String, endVal As String
+    Dim dateStr As String
+    Dim computedDate As Date
+    Dim frontOT As Boolean, backOT As Boolean
+
+    For dIdx = 1 To dayColCount
+        c = dayCols(dIdx)
+        computedDate = CDate(wsShift.Cells(dateRow, c).Value)
+
+        If Year(computedDate) <> targetYear Or Month(computedDate) <> targetMonth Then
+            MsgBox "シフト表の日付（" & Format(computedDate, "yyyy-mm-dd") & "）が、" & vbCrLf & _
+                "1日目の日付（" & targetYear & "年" & targetMonth & "月）と異なる年月になっています。" & vbCrLf & _
+                "前月のシートを流用した際のコピペミス等が考えられます。シフト表を確認してください。", vbExclamation
+            Exit Sub
+        End If
+        dateStr = Format(computedDate, "yyyy-mm-dd")
+
+        For bIdx = 1 To blkCount
+            staffRow = blkRow(bIdx)
+            staffName = Trim(wsShift.Cells(staffRow, staffColIdx).Value)
+            normName = NormalizeName(staffName)
+
+            If staffDict.Exists(normName) Then
+                staffRole = staffDict(normName)
+
+                ' ブロック内の「開始/終了」ペアを順番に処理する。
+                ' 4行結合の場合は (1行目,2行目) と (3行目,4行目) の2組。
+                ' 午前だけ・午後だけの勤務もあるため、ペアごとに独立して
+                ' 時刻が入っているかを判定し、入っている組だけを出力する。
+                For pIdx = 1 To blkPairs(bIdx)
+                    sRow = staffRow + (pIdx - 1) * 2
+                    eRow = sRow + 1
+
+                    Set startCell = wsShift.Cells(sRow, c)
+                    Set endCell = wsShift.Cells(eRow, c)
+                    startVal = ReadShiftTimeText(startCell.Value)
+                    endVal = ReadShiftTimeText(endCell.Value)
+
+                    ' 「休」「有給」等の休み表記や空欄はスキップし、時刻形式（コロンを含む）の
+                    ' データのみを勤務日として出力する（表記ゆれに対して頑健にするため）
+                    If IsShiftTime(startVal) And IsShiftTime(endVal) Then
+                        frontOT = (startCell.Interior.Pattern <> xlNone) And (startCell.Interior.Color = otColor)
+                        backOT = (endCell.Interior.Pattern <> xlNone) And (endCell.Interior.Color = otColor)
+
+                        csvText = csvText & _
+                            CSVEscape(dateStr) & "," & _
+                            CSVEscape(SanitizeCell(staffName)) & "," & _
+                            CSVEscape(SanitizeCell(startVal)) & "," & _
+                            CSVEscape(SanitizeCell(endVal)) & "," & _
+                            IIf(frontOT, "TRUE", "FALSE") & "," & _
+                            IIf(backOT, "TRUE", "FALSE") & "," & _
+                            CSVEscape(SanitizeCell(staffRole)) & vbCrLf
+                    End If
+                Next pIdx
+            End If
+        Next bIdx
+    Next dIdx
+
+    '---- 名前を付けて保存ダイアログ ----
+    Dim fName As Variant
+    fName = Application.GetSaveAsFilename( _
+        InitialFileName:=targetYear & "-" & Format(targetMonth, "00") & "_shift.csv", _
+        FileFilter:="CSVファイル (*.csv), *.csv")
+
+    If VarType(fName) = vbBoolean Then
+        Exit Sub   ' キャンセルされた場合
+    End If
+
+    '---- UTF-8で書き出し ----
+    Dim stm As Object
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2            ' adTypeText
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText csvText
+    stm.SaveToFile fName, 2  ' adSaveCreateOverWrite
+    stm.Close
+
+    Dim rowCount As Long
+    rowCount = (Len(csvText) - Len(Replace(csvText, vbCrLf, ""))) \ Len(vbCrLf) - 1  ' ヘッダー分を除いた件数
+
+    Dim doneMsg As String
+    doneMsg = "CSVファイルを出力しました。" & vbCrLf & _
+        fName & vbCrLf & vbCrLf & _
+        "出力件数：" & rowCount & "件"
+
+    ' 結合漏れ・想定外の高さがあった場合は、処理は行ったうえで注意喚起する
+    If warnUnmerged <> "" Then
+        doneMsg = doneMsg & vbCrLf & vbCrLf & _
+            "【要確認】氏名セルが結合されていない箇所がありました。" & vbCrLf & _
+            "右隣の列の「開始」「終了」の表記から結合漏れと判断し、" & vbCrLf & _
+            "2行1組として抽出しています。内容が正しいか確認してください。" & vbCrLf & _
+            "該当行：" & warnUnmerged
+    End If
+
+    If warnOddRows <> "" Then
+        doneMsg = doneMsg & vbCrLf & vbCrLf & _
+            "【要確認】氏名セルの結合が想定外の高さ（2行・4行以外）でした。" & vbCrLf & _
+            "先頭から2行1組として抽出できる範囲のみ出力しています。" & vbCrLf & _
+            "該当行：" & warnOddRows
+    End If
+
+    MsgBox doneMsg, IIf(warnUnmerged <> "" Or warnOddRows <> "", vbExclamation, vbInformation)
+
+    Exit Sub
+
+ErrHandler:
+    MsgBox "エラーが発生しました：" & vbCrLf & Err.Description, vbCritical
+End Sub
+
+
+'==============================================================
+' シフト表のスタッフ名の列を上から走査し、1人分の「ブロック」を抽出する
+'
+' 【基本の考え方】
+' 氏名セルの結合範囲（MergeArea）の高さを見て、そのスタッフが何行使って
+' いるかを判定する。
+'   高さ2 → 「開始/終了」のペアが1組（通常の勤務）
+'   高さ4 → 「開始/終了」のペアが2組
+'            （別の役割の仕事があり、午前と午後に分けて着台するスタッフ）
+'   高さ6 → ペア3組（将来6行結合が出てきても自動対応する）
+'
+' 固定の Step 2 で送るのではなく、実際の結合の高さの分だけ次の氏名へ
+' 進むため、途中に1行だけ挿入されるなど行数が変わっても氏名行がズレない。
+'
+' 【結合漏れへの対応】
+' 氏名セルが結合されていない（高さ1）場合、氏名列の右隣の列を見て、
+' その行が「開始」、次の行が「終了」であれば結合漏れとみなし、2行1組
+' として処理を続行する。該当行は warnUnmerged に記録し、呼び出し元で
+' 実行後に注意喚起する。
+'
+' 【想定外の高さ】
+' 高さが奇数（3行など）の場合は、先頭から2行1組で取れる分だけを処理し、
+' 該当行を warnOddRows に記録する。
+'
+' 戻り値：ブロックが1件以上見つかれば True
+'==============================================================
+Private Function ScanStaffBlocks( _
+        wsShift As Worksheet, ByVal staffColIdx As Long, _
+        ByVal staffStartRow As Long, ByVal staffEndRow As Long, _
+        ByRef blkRow() As Long, ByRef blkPairs() As Long, ByRef blkCount As Long, _
+        ByRef warnUnmerged As String, ByRef warnOddRows As String) As Boolean
+
+    Dim maxBlocks As Long
+    maxBlocks = staffEndRow - staffStartRow + 1
+    ReDim blkRow(1 To maxBlocks)
+    ReDim blkPairs(1 To maxBlocks)
+    blkCount = 0
+    warnUnmerged = ""
+    warnOddRows = ""
+
+    Dim r As Long
+    Dim nameCell As Range
+    Dim blockHeight As Long
+    Dim pairs As Long
+    Dim labelCol As Long
+
+    labelCol = staffColIdx + 1   ' 氏名列の右隣＝「開始」「終了」が書かれている列
+
+    r = staffStartRow
+    Do While r <= staffEndRow
+
+        Set nameCell = wsShift.Cells(r, staffColIdx)
+
+        If Trim(nameCell.Value) = "" Then
+            ' 氏名が無い行は空行・区切り行とみなし、1行だけ進める。
+            ' （4行結合の2～4行目は結合セルの左上以外なので値が空になるが、
+            '   下の処理で結合の高さ分まとめて読み飛ばすためここには来ない）
+            r = r + 1
+        Else
+            blockHeight = nameCell.MergeArea.Rows.Count
+
+            If blockHeight = 1 Then
+                ' 結合されていない → 右隣の「開始」「終了」表記で結合漏れかを判断する
+                If LooksLikeStartLabel(wsShift.Cells(r, labelCol).Value) And _
+                   LooksLikeEndLabel(wsShift.Cells(r + 1, labelCol).Value) Then
+                    pairs = 1
+                    blockHeight = 2
+                    warnUnmerged = warnUnmerged & r & "行目（" & Trim(nameCell.Value) & "）, "
+                Else
+                    ' 開始/終了の表記も無い単独行は、氏名列の見出しや注記の
+                    ' 可能性が高いため、警告せずに読み飛ばす
+                    pairs = 0
+                    blockHeight = 1
+                End If
+            Else
+                pairs = blockHeight \ 2
+                If (blockHeight Mod 2) <> 0 Then
+                    warnOddRows = warnOddRows & r & "行目（" & Trim(nameCell.Value) & _
+                                  "：" & blockHeight & "行結合）, "
+                End If
+            End If
+
+            If pairs > 0 Then
+                ' C11（検索最終行）を超える分は処理しない
+                Do While pairs > 0
+                    If r + pairs * 2 - 1 <= staffEndRow Then Exit Do
+                    pairs = pairs - 1
+                Loop
+            End If
+
+            If pairs > 0 Then
+                blkCount = blkCount + 1
+                blkRow(blkCount) = r
+                blkPairs(blkCount) = pairs
+            End If
+
+            r = r + blockHeight
+        End If
+    Loop
+
+    If Len(warnUnmerged) > 0 Then warnUnmerged = Left(warnUnmerged, Len(warnUnmerged) - 2)
+    If Len(warnOddRows) > 0 Then warnOddRows = Left(warnOddRows, Len(warnOddRows) - 2)
+
+    ScanStaffBlocks = (blkCount > 0)
+End Function
+
+
+'==============================================================
+' 「開始」を表すラベルかどうかを判定（結合漏れの検出に使用）
+' 「開始」「始」「IN」など表記ゆれをある程度吸収する
+'==============================================================
+Private Function LooksLikeStartLabel(ByVal v As Variant) As Boolean
+    Dim s As String
+    s = NormalizeName(CStr(v))
+    s = Replace(s, " ", "")
+    LooksLikeStartLabel = (s = "開始" Or s = "始" Or s = "開始時刻" Or _
+                           UCase(s) = "IN" Or UCase(s) = "START")
+End Function
+
+
+'==============================================================
+' 「終了」を表すラベルかどうかを判定（結合漏れの検出に使用）
+'==============================================================
+Private Function LooksLikeEndLabel(ByVal v As Variant) As Boolean
+    Dim s As String
+    s = NormalizeName(CStr(v))
+    s = Replace(s, " ", "")
+    LooksLikeEndLabel = (s = "終了" Or s = "終" Or s = "終了時刻" Or _
+                         UCase(s) = "OUT" Or UCase(s) = "END")
+End Function
+
+
+
+'==============================================================
+' 「VBA実行シート」の設定値を読み込み、内容を検証する
+' 不備があれば False を返し、errMsg に具体的な原因（どのセルか）を格納する
+'
+' 【セル配置（B列＝ラベル、C列＝値）】
+'   C5  シフトが入力されているシートの名前は？
+'   C7  月初の日付（1日）が入力されている列は？
+'   C8  月初の日付（1日）が入力されている行は？
+'   C9  スタッフ名が入力されている列は？
+'   C10 最初のスタッフは何行目？
+'   C11 スタッフ検索は何行目まで行う？
+'   C12 残業セルの色は？（セルの塗りつぶし色そのもの）
+'
+' ※年・月はシフト表の日付セル（完全な日付）から自動取得するため、
+'   このシートでは指定不要。
+'==============================================================
+Private Function ValidateAndLoadSettings( _
+        wsCtrl As Worksheet, _
+        ByRef shiftSheetName As String, _
+        ByRef dateStartColLetter As String, ByRef staffColLetter As String, _
+        ByRef dateRow As Long, ByRef staffStartRow As Long, ByRef staffEndRow As Long, _
+        ByRef otColor As Long, ByRef errMsg As String) As Boolean
+
+    ValidateAndLoadSettings = False
+
+    shiftSheetName = Trim(wsCtrl.Range("C5").Value)
+    If shiftSheetName = "" Then
+        errMsg = "C5セル（シフトが入力されているシートの名前は？）を入力してください。"
+        Exit Function
+    End If
+
+    dateStartColLetter = Trim(wsCtrl.Range("C7").Value)
+    If Not IsValidColumnLetter(dateStartColLetter) Then
+        errMsg = "C7セル（月初の日付（1日）が入力されている列は？）には「D」のような列のアルファベットを入力してください。"
+        Exit Function
+    End If
+
+    If Not IsNumeric(wsCtrl.Range("C8").Value) Then
+        errMsg = "C8セル（月初の日付（1日）が入力されている行は？）に数値を入力してください。"
+        Exit Function
+    End If
+    dateRow = CLng(wsCtrl.Range("C8").Value)
+    If dateRow < 1 Then
+        errMsg = "C8セル（月初の日付（1日）が入力されている行は？）は1以上の行番号を入力してください。"
+        Exit Function
+    End If
+
+    staffColLetter = Trim(wsCtrl.Range("C9").Value)
+    If Not IsValidColumnLetter(staffColLetter) Then
+        errMsg = "C9セル（スタッフ名が入力されている列は？）には「B」のような列のアルファベットを入力してください。"
+        Exit Function
+    End If
+
+    If Not IsNumeric(wsCtrl.Range("C10").Value) Then
+        errMsg = "C10セル（最初のスタッフは何行目？）に数値を入力してください。"
+        Exit Function
+    End If
+    staffStartRow = CLng(wsCtrl.Range("C10").Value)
+    If staffStartRow < 1 Then
+        errMsg = "C10セル（最初のスタッフは何行目？）は1以上の行番号を入力してください。"
+        Exit Function
+    End If
+
+    If Not IsNumeric(wsCtrl.Range("C11").Value) Then
+        errMsg = "C11セル（スタッフ検索は何行目まで行う？）に数値を入力してください。"
+        Exit Function
+    End If
+    staffEndRow = CLng(wsCtrl.Range("C11").Value)
+
+    If staffEndRow < staffStartRow Then
+        errMsg = "C11セル（スタッフ検索の最終行：" & staffEndRow & "）が" & vbCrLf & _
+                 "C10セル（最初のスタッフの行：" & staffStartRow & "）より小さくなっています。"
+        Exit Function
+    End If
+
+    If wsCtrl.Range("C12").Interior.Pattern = xlNone Then
+        errMsg = "C12セル（残業セルの色は？）に、シフト表の残業セルと同じ塗りつぶし色を設定してください。"
+        Exit Function
+    End If
+    otColor = wsCtrl.Range("C12").Interior.Color
+
+    ValidateAndLoadSettings = True
+End Function
+
+
+'==============================================================
+' 列番号を列アルファベット表記（例：8 → "H"）に変換する
+' エラーメッセージで、どのセルが問題かを分かりやすく示すために使用
+'==============================================================
+Private Function ColLetter(ws As Worksheet, ByVal col As Long) As String
+    ColLetter = Split(ws.Columns(col).Address(False, False), ":")(0)
+End Function
+
+
+'==============================================================
+' 列のアルファベット表記（A, B, ..., Z, AA, AB, ...）として妥当かを判定
+'==============================================================
+Private Function IsValidColumnLetter(ByVal s As String) As Boolean
+    Dim i As Long, ch As String
+
+    If Len(s) = 0 Or Len(s) > 3 Then
+        IsValidColumnLetter = False
+        Exit Function
+    End If
+
+    For i = 1 To Len(s)
+        ch = UCase(Mid(s, i, 1))
+        If ch < "A" Or ch > "Z" Then
+            IsValidColumnLetter = False
+            Exit Function
+        End If
+    Next i
+
+    IsValidColumnLetter = True
+End Function
+
+
+'==============================================================
+' 「スタッフ一覧」シートから抽出対象スタッフの一覧をDictionaryとして取得
+' シート構成：A列＝氏名、B列＝役割（見出し行は「氏名」「役割」）
+'
+' A列から「氏名」という見出しセルをFindで探し、その次の行からデータを
+' 読み込む。この方式により、見出しより上に何行タイトルや説明文があっても
+' （4行でも5行でも、後で行数が変わっても）自動的に正しい開始行を検出できる。
+'
+' 戻り値：Dictionary（キー＝NormalizeNameで正規化した氏名、値＝役割）
+'==============================================================
+Private Function GetStaffDict(ws As Worksheet) As Object
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    Dim headerCell As Range
+    Dim startRow As Long, lastRow As Long, r As Long
+    Dim nm As String, role As String
+
+    Set headerCell = ws.Columns("A").Find( _
+        What:="氏名", LookIn:=xlValues, LookAt:=xlWhole, _
+        SearchOrder:=xlByRows, MatchCase:=False)
+    If headerCell Is Nothing Then
+        ' 「氏名」見出しが見つからない場合、シート構成が想定と異なる可能性が高いため、
+        ' 誤って先頭行から読み込まず、空のDictionaryを返して呼び出し元でエラー表示させる
+        Set GetStaffDict = dict
+        Exit Function
+    End If
+    startRow = headerCell.Row + 1
+
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+
+    For r = startRow To lastRow
+        nm = NormalizeName(ws.Cells(r, "A").Value)
+        If nm <> "" Then
+            role = Trim(ws.Cells(r, "B").Value)
+            If Not dict.Exists(nm) Then dict.Add nm, role
+        End If
+    Next r
+
+    Set GetStaffDict = dict
+End Function
+
+
+'==============================================================
+' 氏名比較用の正規化
+' ・タブ文字を半角スペースに統一
+' ・全角スペース(Chr(12288))を半角スペースに統一
+' ・連続する半角スペースを1つに統一
+' ・前後の空白を除去
+' これにより「山田　一郎」（全角スペース）と「山田 一郎」（半角スペース）を
+' 同一人物として認識できるようにする
+'==============================================================
+Private Function NormalizeName(ByVal s As String) As String
+    Dim result As String
+    result = Trim(s)
+    result = Replace(result, vbTab, " ")
+    result = Replace(result, Chr(12288), " ")
+    Do While InStr(result, "  ") > 0
+        result = Replace(result, "  ", " ")
+    Loop
+    NormalizeName = Trim(result)
+End Function
+
+
+'==============================================================
+' セルの値が「数値」または「日付/時刻」として扱えるかどうかを判定する
+'
+' 【重要】VBAのIsNumeric関数は、対象が日付型（Date型）の場合、たとえ
+' 内部的に数値として扱えるものであっても False を返す、という仕様があ
+' る（Microsoft公式ドキュメントにも明記されている既知の挙動）。
+' シフト表の日付セルや、時刻シリアル値が入った開始・終了セルはVBA上で
+' Date型として読み込まれることがあるため、IsNumericだけで判定すると
+' 正しい値が「見つからない」と誤判定されてしまう。
+' そのため、IsNumeric と IsDate の両方でチェックする。
+' なお、空欄（Empty）は数値でも日付でもないものとして扱う。
+'==============================================================
+Private Function IsDateOrNumericValue(ByVal v As Variant) As Boolean
+    If IsEmpty(v) Then
+        IsDateOrNumericValue = False
+    Else
+        IsDateOrNumericValue = IsNumeric(v) Or IsDate(v)
+    End If
+End Function
+
+
+'==============================================================
+' 開始・終了セルの値を「H:MM」形式の文字列として取得する
+' ・セルが文字列（VarType = vbString）の場合：「7:30」のような時刻表記
+'   でも「休」のような休み表記でも、そのままトリムして返す
+'   （文字列に対して数値変換を行うと、内容によっては「型が一致しま
+'   せん」エラーになるため、文字列は一切変換せずそのまま扱う）
+' ・セルが数値または時刻シリアル値（Date型）の場合：[h]:mm 相当の
+'   文字列に変換する（24時間を超える経過時間、例：翌日8:00を意味する
+'   「32:00」にも対応）
+' ・セルが空欄の場合：空文字列を返す
+' これにより、時刻セルが数値入力でもテキスト入力でも同じように
+' 扱えるようにしている（IsShiftTime によるコロン判定はそのまま使える）
+'==============================================================
+Private Function ReadShiftTimeText(ByVal v As Variant) As String
+    If IsEmpty(v) Then
+        ReadShiftTimeText = ""
+    ElseIf VarType(v) = vbString Then
+        ReadShiftTimeText = Trim(v)
+    ElseIf IsNumeric(v) Or IsDate(v) Then
+        ReadShiftTimeText = FormatElapsedTime(CDbl(v))
+    Else
+        ReadShiftTimeText = Trim(CStr(v))
+    End If
+End Function
+
+
+'==============================================================
+' 時刻シリアル値（1日＝1.0）を「[h]:mm」相当の文字列に変換する
+' 24時間を超える値（例：1.333333 → 32時間）も繰り上がらず、経過時間の
+' まま表示する（セルの表示形式が [h]:mm の場合と同じ結果になる）
+'==============================================================
+Private Function FormatElapsedTime(ByVal timeValue As Double) As String
+    Dim totalMinutes As Long
+    totalMinutes = CLng(Round(timeValue * 1440))  ' 1440 = 24時間 × 60分
+    Dim hh As Long, mm As Long
+    hh = totalMinutes \ 60
+    mm = totalMinutes Mod 60
+    FormatElapsedTime = hh & ":" & Format(mm, "00")
+End Function
+
+
+'==============================================================
+' 時刻形式（コロンを含む文字列）かどうかを判定
+' 「休」「有給」「希望休」など表記が何であっても、コロンを含まない
+' 文字列は「その日は勤務なし」として一律スキップできるようにする
+'==============================================================
+Private Function IsShiftTime(ByVal s As String) As Boolean
+    IsShiftTime = (InStr(s, ":") > 0)
+End Function
+
+
+'==============================================================
+' CSVインジェクション対策
+' フィールドの先頭が = + - @ の場合、Excelで直接開いた際に数式として
+' 誤解釈されるのを防ぐため、先頭にシングルクォートを付与して無害化する
+' （通常の氏名・役割・時刻データではまず発生しないが、防御的に対応）
+'==============================================================
+Private Function SanitizeCell(ByVal s As String) As String
+    If Len(s) > 0 Then
+        Select Case Left(s, 1)
+            Case "=", "+", "-", "@"
+                s = "'" & s
+        End Select
+    End If
+    SanitizeCell = s
+End Function
+
+
+'==============================================================
+' CSV用に文字列をエスケープ（カンマ・改行・ダブルクォートを含む場合に対応）
+' 例：「佐藤\n（サポート）」のように改行を含む氏名があっても崩れないようにする
+'==============================================================
+Private Function CSVEscape(ByVal s As String) As String
+    If InStr(s, ",") > 0 Or InStr(s, """") > 0 Or InStr(s, vbLf) > 0 Or InStr(s, vbCr) > 0 Then
+        s = Replace(s, """", """""")
+        CSVEscape = """" & s & """"
+    Else
+        CSVEscape = s
+    End If
+End Function
